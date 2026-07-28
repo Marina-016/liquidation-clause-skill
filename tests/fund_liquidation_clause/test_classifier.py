@@ -105,6 +105,13 @@ class ClassifierRegressionTests(unittest.TestCase):
         )
         self.assert_type(TYPE_2, text, stage=2)
 
+    def test_stage1_accepts_chinese_deadlines_with_arabic_base(self):
+        text = (
+            "连续20个工作日基金份额持有人少于200人或者基金资产净值低于"
+            "5000万元。连续60个工作日出现前述情形，基金管理人应当在"
+            "十个工作日内向中国证监会报告，并在六个月内召集基金份额持有人大会。"
+        )
+        self.assert_type(TYPE_2, text, stage=1)
     def test_stage3_tolerates_ocr_separators(self):
         text = (
             "连·续·二·十·个·工·作·日基金份额持有人少于二·百·人或者"
@@ -131,13 +138,13 @@ class ClassifierRegressionTests(unittest.TestCase):
         )
         self.assert_type(None, text)
 
-    def test_sixty_day_termination_wording_is_not_type3(self):
+    def test_sixty_day_termination_wording_is_type3(self):
         text = (
             "连续20个工作日基金份额持有人少于200人或者基金资产净值低于"
             "5000万元。连续60个工作日出现前述情形，基金合同自动终止，"
             "无需召开基金份额持有人大会。"
         )
-        self.assert_type(None, text)
+        self.assert_type(TYPE_3, text)
 
     def test_later_valid_amount_anchor_is_evaluated(self):
         unrelated = "募集规模涉及200人和5000万元。" + "其他事项。" * 200
@@ -190,6 +197,91 @@ class ClassifierRegressionTests(unittest.TestCase):
         )
         self.assert_type(TYPE_3, text)
 
+    def test_type3_accepts_liquidation_then_termination(self):
+        text = (
+            "连续20个工作日基金份额持有人少于200人或者基金资产净值低于"
+            "5000万元。连续50个工作日出现前述情形，本基金进行基金财产清算并终止，"
+            "无需召开基金份额持有人大会。"
+        )
+        self.assert_type(TYPE_3, text)
+
+    def test_type3_accepts_no_meeting_before_sixty_day_conditions(self):
+        text = (
+            "连续20个工作日基金份额持有人少于200人或者基金资产净值低于"
+            "5000万元。出现前述情形时基金合同应当终止并清算，无需召开"
+            "基金份额持有人大会：连续60个工作日基金资产净值低于5000万元。"
+        )
+        self.assert_type(TYPE_3, text)
+
+    def test_type3_accepts_continuation_sentence(self):
+        text = (
+            "连续20个工作日基金份额持有人少于200人或者基金资产净值低于"
+            "5000万元。连续60个工作日出现前述情形，本基金清算并终止。"
+            "由上述情形导致基金合同终止，无需召开基金份额持有人大会。"
+        )
+        self.assert_type(TYPE_3, text)
+
+    def test_type1_accepts_explanation_and_submitted_solution(self):
+        text = (
+            "连续二十个工作日基金份额持有人少于二百人或者基金资产净值低于"
+            "五千万元。连续六十个工作日出现前述情形，基金管理人应当向"
+            "中国证监会说明原因并报送解决方案，并召开基金份额持有人大会。"
+        )
+        self.assert_type(TYPE_1, text, stage=2)
+
+    def test_type1_when_ten_day_report_has_no_six_month_meeting(self):
+        text = (
+            "连续20个工作日基金份额持有人少于200人或者基金资产净值低于"
+            "5000万元。连续60个工作日出现前述情形，基金管理人应当在"
+            "10个工作日内向中国证监会报告并提出解决方案。"
+        )
+        self.assert_type(TYPE_1, text, stage=2)
+
+    def test_type2_tolerates_pdf_header_inside_holder_phrase(self):
+        text = (
+            "连续20个工作日基金份额持有人少于200人或者基金资产净值低于"
+            "5000万元。连续60个工作日出现前述情形，基金管理人应当在"
+            "10个工作日内向中国证监会报告，并在6个月内召集基金份额持有"
+            "某基金基金合同13人大会。"
+        )
+        self.assert_type(TYPE_2, text, stage=2)
+    def test_type2_accepts_fifty_day_deadline_chain(self):
+        text = (
+            "连续20个工作日基金份额持有人少于200人或者基金资产净值低于"
+            "5000万元。连续50个工作日出现前述情形，基金管理人应当在"
+            "10个工作日内向中国证监会报告并提出解决方案，并在6个月内"
+            "召开基金份额持有人大会。"
+        )
+        self.assert_type(TYPE_2, text, stage=2)
+
+    def test_stage3_accepts_legacy_hundred_holder_direct_termination(self):
+        text = (
+            "基金份额持有人数量连续20个工作日达不到100人，或连续20个工作日"
+            "基金资产净值低于5000万元，基金管理人应当向中国证监会报告并提出"
+            "解决方案。基金份额持有人数量连续60个工作日达不到100人，或连续"
+            "60个工作日基金资产净值低于5000万元，本基金应当终止，并报中国"
+            "证监会备案。"
+        )
+        self.assert_type(None, text, stage=2)
+        self.assert_type(TYPE_3, text, stage=3)
+
+    def test_stage3_accepts_legacy_twenty_day_report_and_solution(self):
+        text = (
+            "基金份额持有人数量不满200人或者基金资产净值低于5000万元，"
+            "基金管理人应当及时报告中国证监会；连续20个工作日出现前述情形，"
+            "基金管理人应当向中国证监会说明原因并报送解决方案。"
+        )
+        self.assert_type(TYPE_1, text, stage=3)
+
+    def test_amount_5000_does_not_create_false_fifty_day_trigger(self):
+        text = (
+            "基金份额持有人数量不满200人或者基金资产净值低于5000万元，"
+            "基金管理人应当及时报告中国证监会；连续20个工作日出现前述情形，"
+            "基金管理人应当向中国证监会说明原因并报送解决方案。"
+        )
+        actual, _, detail = classify(text, stage=3)
+        self.assertEqual(TYPE_1, actual)
+        self.assertFalse(detail["has_50"])
     def test_invalid_stage_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "stage must be 1, 2, or 3"):
             classify("任意文本", stage=0)

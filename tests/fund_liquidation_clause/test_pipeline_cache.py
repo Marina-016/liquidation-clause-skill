@@ -13,6 +13,8 @@ from pipeline import (
     PIPELINE_VERSION,
     filter_unclassified_funds,
     load_cached_results,
+    make_unclassified_result,
+    record_failure_attempt,
     save_results_cache,
 )
 
@@ -75,6 +77,39 @@ class PipelineCacheTests(unittest.TestCase):
         candidates = filter_unclassified_funds(self.funds, results)
         self.assertEqual([self.funds[1]], candidates)
 
+
+    def test_failure_history_preserves_each_stage_reason(self):
+        histories = {}
+        first = record_failure_attempt(
+            {
+                "code": "000002",
+                "source": "基金合同",
+                "s3Url": "contract.pdf",
+                "reason": "分类规则未命中",
+            },
+            "阶段一",
+            histories,
+        )
+        second = record_failure_attempt(
+            {
+                "code": "000002",
+                "source": "CSRC证监会(基金合同)",
+                "s3Url": "csrc.pdf",
+                "reason": "PDF解析失败",
+            },
+            "阶段三",
+            histories,
+        )
+        final = make_unclassified_result(
+            self.funds[1],
+            histories["000002"],
+        )
+
+        self.assertEqual(1, len(first["failureHistory"]))
+        self.assertEqual(2, len(second["failureHistory"]))
+        self.assertEqual(2, len(final["failureHistory"]))
+        self.assertIn("阶段一: 分类规则未命中", final["reason"])
+        self.assertIn("阶段三: PDF解析失败", final["reason"])
 
 if __name__ == "__main__":
     unittest.main()

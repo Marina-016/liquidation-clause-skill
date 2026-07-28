@@ -4,7 +4,8 @@
 清盘条款分类 — 三级递进流水线主入口。
 
 阶段一: Datayes 基金合同 → PyMuPDF
-阶段二: 替代公告源(招募说明书/发售公告等) → PyMuPDF+pypdf
+阶段二A: 同一份完整基金合同宽松复判 → PyMuPDF+pypdf
+阶段二B: 替代公告源(招募说明书/发售公告等) → PyMuPDF+pypdf
 阶段三: CSRC 证监会兜底 → pypdf
 
 用法: python pipeline.py <基金列表.xlsx> [--output <输出.xlsx>] [--work-dir <工作目录>]
@@ -13,7 +14,7 @@
 import os, sys, json, time, argparse
 
 
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
 PIPELINE_VERSION = "0.2.0"
 CHECKPOINT_INTERVAL = 25
 
@@ -94,8 +95,33 @@ def filter_unclassified_funds(funds: list, *result_groups: list) -> list:
     return [fund for fund in funds if fund[0] not in classified_codes]
 
 
-def make_unclassified_result(fund: tuple) -> dict:
+def record_failure_attempt(
+    result: dict,
+    attempt: str,
+    failure_history_by_code: dict,
+) -> dict:
+    """记录一次失败及其文档来源，返回带完整失败轨迹的结果副本。"""
+    code = str(result.get("code", ""))
+    history = failure_history_by_code.setdefault(code, [])
+    failure = {
+        "attempt": attempt,
+        "source": result.get("source", ""),
+        "s3Url": result.get("s3Url", ""),
+        "reason": result.get("reason", "") or "未提供失败原因",
+    }
+    if failure not in history:
+        history.append(failure)
+    tracked = dict(result)
+    tracked["failureHistory"] = list(history)
+    tracked["reason"] = "；".join(
+        f"{item['attempt']}: {item['reason']}" for item in history
+    )
+    return tracked
+
+
+def make_unclassified_result(fund: tuple, failure_history: list = None) -> dict:
     code, name, mgr, type1, type2 = fund
+    history = list(failure_history or [])
     return {
         "code": code,
         "name": name,
@@ -107,7 +133,13 @@ def make_unclassified_result(fund: tuple) -> dict:
         "s3Url": "",
         "source": "",
         "stage": 3,
-        "reason": "三阶段均未成功分类",
+        "reason": (
+            "；".join(
+                f"{item['attempt']}: {item['reason']}" for item in history
+            )
+            or "三阶段均未成功分类"
+        ),
+        "failureHistory": history,
     }
 
 def read_fund_list(xlsx_path: str) -> list:
@@ -254,20 +286,35 @@ def main():
                 flush=True,
             )
 
-    checkpoint_by_code = {
-        result["code"]: result for result in cached_results
-    }
+    checkpoint_by_code = {result["code"]: result for result in cached_results}
+    failure_history_by_code = {}
     checkpoint_pending = 0
 
     def checkpoint_result(result: dict) -> None:
         nonlocal checkpoint_pending
-        if not result.get("clauseType"):
-            return
         checkpoint_by_code[result["code"]] = result
         checkpoint_pending += 1
         if checkpoint_pending >= CHECKPOINT_INTERVAL:
             save_results_cache(cache_path, list(checkpoint_by_code.values()))
             checkpoint_pending = 0
+
+    def stage_result_handler(attempt: str):
+        def handle(result: dict) -> None:
+            if result.get("clauseType"):
+                history = failure_history_by_code.get(str(result.get("code")))
+                if history:
+                    result["failureHistory"] = list(history)
+                checkpoint_result(result)
+                return
+            checkpoint_result(
+                record_failure_attempt(
+                    result,
+                    attempt,
+                    failure_history_by_code,
+                )
+            )
+
+        return handle
 
     # ============== 阶段一: Datayes 基金合同 ==============
     t0 = time.time()
@@ -281,7 +328,7 @@ def main():
             pending_funds,
             pdf_dir,
             stage=1,
-            on_result=checkpoint_result,
+            on_result=stage_result_handler("阶段一(完整基金合同严格分类)"),
         )
     else:
         print("\n[阶段一] 无需执行(全部命中结果缓存)", flush=True)
@@ -292,23 +339,51 @@ def main():
     elif pending_funds:
         print("\n  → 阶段一全部完成!", flush=True)
 
-    # ============== 阶段二: 替代公告源 ==============
-    s2_classified = []
-    s2_not_found = []
+    # ============== 阶段二A: 同合同宽松复判 ==============
+    s2_contract_classified = []
+    s2_contract_not_found = []
     if s1_not_found:
         print(f"\n{'='*60}", flush=True)
-        print(f"[阶段二] 替代公告源 (处理 {len(s1_not_found)} 只未分类)", flush=True)
+        print(
+            f"[阶段二A] 同合同宽松复判 (处理 {len(s1_not_found)} 只未分类)",
+            flush=True,
+        )
         print(f"{'='*60}", flush=True)
-        s2_classified, s2_not_found = run_stage_1_2(
+        s2_contract_classified, s2_contract_not_found = run_stage_1_2(
             s1_not_found,
             pdf_dir,
             stage=2,
-            on_result=checkpoint_result,
+            document_stage=1,
+            source_override="基金合同(宽松复判)",
+            on_result=stage_result_handler("阶段二A(同合同宽松复判)"),
         )
         save_results_cache(cache_path, list(checkpoint_by_code.values()))
     else:
-        print("\n[阶段二] 无需执行(阶段一或缓存已全覆盖)", flush=True)
+        print("\n[阶段二A] 无需执行(阶段一或缓存已全覆盖)", flush=True)
 
+    # ============== 阶段二B: 替代公告源 ==============
+    s2_alternative_classified = []
+    s2_not_found = []
+    if s2_contract_not_found:
+        print(f"\n{'='*60}", flush=True)
+        print(
+            f"[阶段二B] 替代公告源 "
+            f"(处理 {len(s2_contract_not_found)} 只未分类)",
+            flush=True,
+        )
+        print(f"{'='*60}", flush=True)
+        s2_alternative_classified, s2_not_found = run_stage_1_2(
+            s2_contract_not_found,
+            pdf_dir,
+            stage=2,
+            document_stage=2,
+            on_result=stage_result_handler("阶段二B(替代公告源)"),
+        )
+        save_results_cache(cache_path, list(checkpoint_by_code.values()))
+    elif s1_not_found:
+        print("\n[阶段二B] 无需执行(同合同宽松复判已全覆盖)", flush=True)
+
+    s2_classified = s2_contract_classified + s2_alternative_classified
     # ============== 阶段三: CSRC 兜底 ==============
     s3_classified = []
     s3_not_found = []
@@ -329,7 +404,7 @@ def main():
         s3_classified, s3_not_found = run_stage_3(
             s3_candidates,
             pdf_dir,
-            on_result=checkpoint_result,
+            on_result=stage_result_handler("阶段三(CSRC证监会兜底)"),
         )
         save_results_cache(cache_path, list(checkpoint_by_code.values()))
     elif args.skip_stage3:
@@ -344,7 +419,13 @@ def main():
         + s1_classified
         + s2_classified
         + s3_classified
-        + [make_unclassified_result(fund) for fund in s3_not_found]
+        + [
+            make_unclassified_result(
+                fund,
+                failure_history_by_code.get(fund[0], []),
+            )
+            for fund in s3_not_found
+        ]
     )
     result_by_code = {result["code"]: result for result in all_results}
     all_results = [
@@ -370,7 +451,14 @@ def main():
     print(f"{'='*60}", flush=True)
     print(f"  缓存复用:                  {len(cached_results)} 只", flush=True)
     print(f"  阶段一(Datayes基金合同):   {len(s1_classified)} 只", flush=True)
-    print(f"  阶段二(替代公告源):        {len(s2_classified)} 只", flush=True)
+    print(
+        f"  阶段二A(同合同宽松复判):   {len(s2_contract_classified)} 只",
+        flush=True,
+    )
+    print(
+        f"  阶段二B(替代公告源):       {len(s2_alternative_classified)} 只",
+        flush=True,
+    )
     print(f"  阶段三(CSRC证监会):        {len(s3_classified)} 只", flush=True)
     print("  ─────────────────────", flush=True)
     print(f"  可自动分类:                {classified}/{total} ({classified_pct:.1f}%)", flush=True)
