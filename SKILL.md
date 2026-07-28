@@ -75,6 +75,7 @@ python3 -X utf8 <skill_root>/scripts/pipeline.py "{用户输入的Excel路径}"
 - `--output <路径>`：指定输出 Excel 路径（默认：`{输入目录}/清盘条款分类.xlsx`）
 - `--work-dir <目录>`：工作目录（保存 PDF 缓存和中间 JSON）
 - `--skip-stage3`：跳过 CSRC 阶段（无网络/限流时可用）
+- `--no-resume`：忽略已有结果缓存，从头重新处理全部基金
 - `--token <token>`：Datayes API Token（优先读环境变量 `DATAYES_TOKEN`）
 
 示例：
@@ -92,7 +93,7 @@ python3 -X utf8 <skill_root>/scripts/pipeline.py "C:\Users\xxx\基金列表.xlsx
 | `表2-基金明细` | 逐只：代码、名称、管理人、分类、条款类型、条款原文、合同PDF链接、数据来源、分类阶段 |
 | `表3-统计说明` | 分类标准、数据源说明、解析引擎说明、分阶段统计 |
 
-同时输出 `results_cache.json`（保存本次中间结果，便于复核或后续人工复用；当前脚本不会自动读取旧缓存跳过已分类基金）。
+同时输出版本化的 `results_cache.json`。脚本默认自动复用当前流水线版本中已成功分类的基金；失败记录会继续重试，并且每新增 25 条成功结果及每个阶段结束时原子保存检查点。旧版无结构缓存或不同流水线版本的缓存不会自动复用。
 
 ## 分类逻辑
 
@@ -108,17 +109,24 @@ elif 60日 and 报告证监会 and 提出解决方案 and 召开大会 and 无�
 
 ## 注意事项
 
-- 阶段三默认 5 worker 并行；若遇到 CSRC 限流，可临时调低 `scripts/csrc_api.py` 中的 `CSRC_WORKERS`
-- PDF 下载 URL 级 MD5 去重缓存（同 URL 只下一次）
-- 阶段一/二并行度：`max(API_WORKERS, DL_WORKERS)`，默认 10 worker
+- 阶段三默认 8 worker 并行，并在入口再次排除已有成功结果；若遇到 CSRC 限流，可临时调低 `scripts/csrc_api.py` 中的 `CSRC_WORKERS`
+- PDF 下载使用 URL 级 MD5 文件缓存；同一轮流水线中的相同 URL 只下载、解析和分类一次
+- 阶段一/二使用独立流式线程池：API 16 worker、下载 16 worker、PDF 解析 8 worker，上游完成后立即进入下一环节
 - A/C 份额可能共用同一份合同，链接可能相同
 - 发起式基金叠加"成立满3年+净值<2亿自动终止"条款，本次以标准存续期条款为准
 
+## 跨平台运行
+
+- Windows 建议始终使用 `python -X utf8`，避免系统 GBK 默认编码影响中文日志、JSON 和路径；macOS/Linux 使用 `python3 -X utf8`。
+- CSRC 阶段在 Windows 优先调用 PowerShell，其他系统或 PowerShell 失败时自动切换到 Python `urllib`。
+- Excel 使用“微软雅黑”显示中文；非 Windows 系统未安装该字体时，Excel 软件会使用本地可用中文字体替代，不影响数据内容。
 ## 执行约束
 
 - 禁止网页搜索：本 Skill 只使用已声明的 Datayes API、Datayes S3 PDF 和 CSRC 信息披露平台，不使用 WebSearch/WebFetch
 - Host 白名单：脚本请求前校验目标域名，允许 `gw.datayes.com`、`r.datayes.com`、`bigdata-s3.wmcloud.com`、`eid.csrc.gov.cn`
-- 减少重复请求：同一 PDF URL 按 MD5 文件名缓存，同一轮运行内复用相同 URL 的分类结果
+- 减少重复请求：同一 PDF URL 按 MD5 文件名缓存，同一轮运行内复用相同 URL 的下载、解析和分类结果
+- 断点续跑：仅复用 `schemaVersion=2` 且 `pipelineVersion=0.2.0` 的成功结果，失败项和不兼容缓存必须重新处理
+- CSRC 输入约束：阶段三只允许接收阶段一、阶段二及缓存均未成功分类的基金
 - 运行产物：输出 Excel、PDF 缓存和 `results_cache.json` 写入输入目录或 `--work-dir` 指定目录，不要求写入 skill 根目录
 
 ## Token

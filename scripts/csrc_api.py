@@ -3,7 +3,7 @@
 """
 阶段三: CSRC 证监会信息披露平台兜底。
 搜索 FA020010(基金合同) / FA010010(招募说明书) → 下载 PDF → pypdf 解析 → 分类
-仅处理阶段一+二均未成功分类的基金，默认 5 worker 并行。
+仅处理阶段一+二均未成功分类的基金，默认 8 worker 并行。
 """
 
 import os, json, time, re, subprocess, tempfile, logging
@@ -15,7 +15,7 @@ from classifier import classify
 # Suppress pypdf noise
 logging.disable(logging.CRITICAL)
 
-CSRC_WORKERS = 5  # 并行数
+CSRC_WORKERS = 8  # 并行数
 
 CSRC_SEARCH_URL = (
     "http://eid.csrc.gov.cn/fund/disclose/advanced_search_report.do"
@@ -310,10 +310,10 @@ def text_preview(text: str, max_len: int = 800) -> str:
 
 
 def run_stage(
-    funds: list, out_dir: str, verbose: bool = True
+    funds: list, out_dir: str, verbose: bool = True, on_result=None
 ) -> tuple:
     """
-    执行阶段三: CSRC 兜底(并行, 默认5 worker)。
+    执行阶段三: CSRC 兜底(并行, 默认8 worker)。
 
     Args:
         funds: [(code, name, mgr, type1, type2), ...]  待处理基金列表
@@ -350,7 +350,30 @@ def run_stage(
     with ThreadPoolExecutor(max_workers=CSRC_WORKERS) as executor:
         futures = {executor.submit(process_one, f): f for f in funds}
         for future in as_completed(futures):
-            r = future.result()
+            fund = futures[future]
+            try:
+                r = future.result()
+            except Exception as exc:
+                code, name, mgr, type1, type2 = fund
+                r = {
+                    "code": code,
+                    "name": name,
+                    "mgr": mgr,
+                    "type1": type1,
+                    "type2": type2,
+                    "clauseType": None,
+                    "clauseText": "",
+                    "s3Url": "",
+                    "source": "",
+                    "stage": 3,
+                    "reason": f"阶段3: CSRC处理失败 ({exc})",
+                }
+            if on_result:
+                try:
+                    on_result(r)
+                except Exception as exc:
+                    if verbose:
+                        print(f"   [警告] 保存检查点失败: {exc}", flush=True)
             if r["clauseType"]:
                 classified.append(r)
             else:

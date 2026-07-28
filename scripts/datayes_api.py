@@ -8,8 +8,8 @@
 
 import os, sys, json, time, hashlib, urllib.request, urllib.parse
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from threading import Lock, local
 from collections import defaultdict
 
 from classifier import classify, text_preview
@@ -20,23 +20,21 @@ ALLOWED_HOSTS = {
     "r.datayes.com",
     "bigdata-s3.wmcloud.com",
 }
-API_WORKERS = 10
-DL_WORKERS = 10
-PARSE_WORKERS = 6
+API_WORKERS = 16
+DL_WORKERS = 16
+PARSE_WORKERS = 8
 
 # ============== S3 下载 ==============
-_s3_session = None
-_s3_session_lock = Lock()
+_s3_session_local = local()
 
 
 def get_s3_session():
-    global _s3_session
-    if _s3_session is None:
-        with _s3_session_lock:
-            if _s3_session is None:
-                _s3_session = requests.Session()
-                _s3_session.trust_env = False
-    return _s3_session
+    session = getattr(_s3_session_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.trust_env = False
+        _s3_session_local.session = session
+    return session
 
 
 def validate_url(url: str) -> None:
@@ -342,59 +340,205 @@ def process_fund_datayes(fund, out_dir, stage: int, url_cache: dict, cache_lock:
 # ============== 批量执行 ==============
 
 
+def _base_result(fund: tuple, stage: int) -> dict:
+    code, name, mgr, type1, type2 = fund
+    return {
+        "code": code,
+        "name": name,
+        "mgr": mgr,
+        "type1": type1,
+        "type2": type2,
+        "clauseType": None,
+        "clauseText": "",
+        "s3Url": "",
+        "source": "",
+        "stage": stage,
+        "reason": "",
+    }
+
+
+def _parse_and_classify(pdf_path: str, stage: int) -> dict:
+    text, parse_err = parse_pdf(pdf_path, stage)
+    if not text:
+        return {
+            "clauseType": None,
+            "clauseText": "",
+            "reason": f"阶段{stage}: {parse_err or 'PDF解析失败'}",
+        }
+
+    clause_type, clause_text, detail = classify(text, stage)
+    reason = ""
+    if not clause_type:
+        reason = (
+            f"阶段{stage}: 分类规则未命中 "
+            f"(has_20={detail.get('has_20')}, "
+            f"has_60={detail.get('has_60')}, "
+            f"report={detail.get('has_report')}, "
+            f"meeting={detail.get('has_meeting')})"
+        )
+    return {
+        "clauseType": clause_type,
+        "clauseText": text_preview(clause_text),
+        "reason": reason,
+    }
+
+
+def _apply_payload(result: dict, payload: dict) -> dict:
+    result.update(payload)
+    return result
+
+
 def run_stage(
-    funds: list, out_dir: str, stage: int, verbose: bool = True
+    funds: list,
+    out_dir: str,
+    stage: int,
+    verbose: bool = True,
+    on_result=None,
 ) -> tuple:
     """
-    执行阶段 1 或 2。
+    执行阶段 1 或 2，使用独立的 API、下载和解析线程池。
 
     Args:
-        funds: [(code, name, mgr, type1, type2), ...]  待处理基金列表
+        funds: [(code, name, mgr, type1, type2), ...] 待处理基金列表
         out_dir: PDF 下载缓存目录
         stage: 1 或 2
+        on_result: 可选回调，每只基金完成后接收结果 dict
 
     Returns:
         (classified_list, not_found_list)
-        - classified_list: 已成功分类的基金结果
-        - not_found_list: 未分类的基金 (code, name, mgr, type1, type2)
     """
-    classified = []
-    not_found = []
-    url_cache = {}
-    cache_lock = Lock()
-
-    stats = {"done": 0, "api": 0}
-    stats_lock = Lock()
-
-    def process_one(f):
-        r = process_fund_datayes(f, out_dir, stage, url_cache, cache_lock)
-        with stats_lock:
-            stats["done"] += 1
-        return r
-
     total = len(funds)
     if total == 0:
         if verbose:
             print("   完成: 已分类 0, 未分类 0 (0.0%)", flush=True)
-        return classified, not_found
+        return [], []
 
-    with ThreadPoolExecutor(max_workers=max(API_WORKERS, DL_WORKERS)) as executor:
-        futures = {executor.submit(process_one, f): f for f in funds}
-        for future in as_completed(futures):
-            r = future.result()
-            if r["clauseType"]:
-                classified.append(r)
-            else:
-                not_found.append(
-                    (r["code"], r["name"], r["mgr"], r["type1"], r["type2"])
-                )
+    results = [None] * total
+    done_count = 0
+    classified_count = 0
 
-            if verbose and stats["done"] % 20 == 0:
-                print(
-                    f"   [{stats['done']}/{total}]  "
-                    f"已分类:{len(classified)}  未分类:{len(not_found)}",
-                    flush=True,
-                )
+    def finalize(index: int, result: dict) -> None:
+        nonlocal done_count, classified_count
+        if results[index] is not None:
+            return
+        results[index] = result
+        done_count += 1
+        if result.get("clauseType"):
+            classified_count += 1
+        if on_result:
+            try:
+                on_result(result)
+            except Exception as exc:
+                if verbose:
+                    print(f"   [警告] 保存检查点失败: {exc}", flush=True)
+        if verbose and (done_count % 20 == 0 or done_count == total):
+            print(
+                f"   [{done_count}/{total}]  "
+                f"已分类:{classified_count}  未分类:{done_count - classified_count}",
+                flush=True,
+            )
+
+    # 这些映射只由协调线程修改，因此 URL 去重不需要额外加锁。
+    url_waiters = {}
+    payload_cache = {}
+
+    with (
+        ThreadPoolExecutor(max_workers=API_WORKERS) as api_executor,
+        ThreadPoolExecutor(max_workers=DL_WORKERS) as download_executor,
+        ThreadPoolExecutor(max_workers=PARSE_WORKERS) as parse_executor,
+    ):
+        api_futures = {
+            api_executor.submit(find_contract, fund[0], stage): (index, fund)
+            for index, fund in enumerate(funds)
+        }
+        download_futures = {}
+        parse_futures = {}
+
+        while api_futures or download_futures or parse_futures:
+            pending = (
+                set(api_futures)
+                | set(download_futures)
+                | set(parse_futures)
+            )
+            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+
+            for future in completed:
+                if future in api_futures:
+                    index, fund = api_futures.pop(future)
+                    result = _base_result(fund, stage)
+                    try:
+                        contract = future.result()
+                    except Exception as exc:
+                        result["reason"] = f"阶段{stage}: API调用失败 ({exc})"
+                        finalize(index, result)
+                        continue
+
+                    if not contract:
+                        result["reason"] = f"阶段{stage}: API未找到可用文档"
+                        finalize(index, result)
+                        continue
+
+                    s3_url = contract["s3Url"]
+                    result["s3Url"] = s3_url
+                    result["source"] = contract["source"]
+
+                    if s3_url in payload_cache:
+                        finalize(
+                            index,
+                            _apply_payload(result, payload_cache[s3_url]),
+                        )
+                    elif s3_url in url_waiters:
+                        url_waiters[s3_url].append((index, result))
+                    else:
+                        url_waiters[s3_url] = [(index, result)]
+                        download_future = download_executor.submit(
+                            download_pdf, s3_url, out_dir
+                        )
+                        download_futures[download_future] = s3_url
+
+                elif future in download_futures:
+                    s3_url = download_futures.pop(future)
+                    try:
+                        pdf_path = future.result()
+                    except Exception:
+                        pdf_path = None
+
+                    if not pdf_path:
+                        payload = {
+                            "clauseType": None,
+                            "clauseText": "",
+                            "reason": f"阶段{stage}: PDF下载失败",
+                        }
+                        payload_cache[s3_url] = payload
+                        for index, result in url_waiters.pop(s3_url):
+                            finalize(index, _apply_payload(result, payload))
+                        continue
+
+                    parse_future = parse_executor.submit(
+                        _parse_and_classify, pdf_path, stage
+                    )
+                    parse_futures[parse_future] = s3_url
+
+                else:
+                    s3_url = parse_futures.pop(future)
+                    try:
+                        payload = future.result()
+                    except Exception as exc:
+                        payload = {
+                            "clauseType": None,
+                            "clauseText": "",
+                            "reason": f"阶段{stage}: PDF解析失败 ({exc})",
+                        }
+                    payload_cache[s3_url] = payload
+                    for index, result in url_waiters.pop(s3_url):
+                        finalize(index, _apply_payload(result, payload))
+
+    classified = [r for r in results if r and r.get("clauseType")]
+    not_found = [
+        (r["code"], r["name"], r["mgr"], r["type1"], r["type2"])
+        for r in results
+        if r and not r.get("clauseType")
+    ]
 
     if verbose:
         print(

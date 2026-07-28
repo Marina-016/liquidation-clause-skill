@@ -13,6 +13,103 @@
 import os, sys, json, time, argparse
 
 
+CACHE_SCHEMA_VERSION = 2
+PIPELINE_VERSION = "0.2.0"
+CHECKPOINT_INTERVAL = 25
+
+
+def save_results_cache(cache_path: str, results: list) -> None:
+    """原子保存版本化结果缓存，避免中断时留下半个 JSON 文件。"""
+    payload = {
+        "schemaVersion": CACHE_SCHEMA_VERSION,
+        "pipelineVersion": PIPELINE_VERSION,
+        "savedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "results": results,
+    }
+    temp_path = f"{cache_path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, cache_path)
+
+
+def load_cached_results(cache_path: str, funds: list) -> tuple:
+    """只复用当前版本缓存中已成功分类的基金，失败记录继续重试。"""
+    if not os.path.exists(cache_path):
+        return [], list(funds)
+
+    try:
+        with open(cache_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return [], list(funds)
+
+    if not isinstance(payload, dict):
+        return [], list(funds)
+    if payload.get("schemaVersion") != CACHE_SCHEMA_VERSION:
+        return [], list(funds)
+    if payload.get("pipelineVersion") != PIPELINE_VERSION:
+        return [], list(funds)
+
+    cached_results = payload.get("results")
+    if not isinstance(cached_results, list):
+        return [], list(funds)
+
+    cached_by_code = {
+        str(result.get("code")): result
+        for result in cached_results
+        if isinstance(result, dict) and result.get("clauseType")
+    }
+    reused = []
+    pending = []
+    for fund in funds:
+        code, name, mgr, type1, type2 = fund
+        cached = cached_by_code.get(code)
+        if not cached:
+            pending.append(fund)
+            continue
+        refreshed = dict(cached)
+        refreshed.update(
+            {
+                "code": code,
+                "name": name,
+                "mgr": mgr,
+                "type1": type1,
+                "type2": type2,
+            }
+        )
+        reused.append(refreshed)
+    return reused, pending
+
+
+def filter_unclassified_funds(funds: list, *result_groups: list) -> list:
+    """排除所有已有成功分类结果的代码，作为下一阶段的硬性入口过滤。"""
+    classified_codes = {
+        str(result.get("code"))
+        for group in result_groups
+        for result in group
+        if isinstance(result, dict) and result.get("clauseType")
+    }
+    return [fund for fund in funds if fund[0] not in classified_codes]
+
+
+def make_unclassified_result(fund: tuple) -> dict:
+    code, name, mgr, type1, type2 = fund
+    return {
+        "code": code,
+        "name": name,
+        "mgr": mgr,
+        "type1": type1,
+        "type2": type2,
+        "clauseType": None,
+        "clauseText": "",
+        "s3Url": "",
+        "source": "",
+        "stage": 3,
+        "reason": "三阶段均未成功分类",
+    }
+
 def read_fund_list(xlsx_path: str) -> list:
     """读取基金列表 Excel，返回 [(code, name, mgr, type1, type2), ...]"""
     import openpyxl
@@ -99,6 +196,11 @@ def main():
     parser.add_argument(
         "--skip-stage3", action="store_true", help="跳过阶段三(CSRC)"
     )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="忽略已有结果缓存，从头重新处理全部基金",
+    )
     parser.add_argument("--token", default=None, help="Datayes API Token(也可设环境变量DATAYES_TOKEN)")
 
     args = parser.parse_args()
@@ -140,81 +242,120 @@ def main():
     funds = read_fund_list(args.input)
     print(f"  {format_fund_list(funds)}", flush=True)
 
+    # ============== 读取缓存 ==============
+    if args.no_resume:
+        cached_results, pending_funds = [], list(funds)
+        print("  已禁用断点续跑，将处理全部基金", flush=True)
+    else:
+        cached_results, pending_funds = load_cached_results(cache_path, funds)
+        if cached_results:
+            print(
+                f"  缓存复用: {len(cached_results)} 只，待处理: {len(pending_funds)} 只",
+                flush=True,
+            )
+
+    checkpoint_by_code = {
+        result["code"]: result for result in cached_results
+    }
+    checkpoint_pending = 0
+
+    def checkpoint_result(result: dict) -> None:
+        nonlocal checkpoint_pending
+        if not result.get("clauseType"):
+            return
+        checkpoint_by_code[result["code"]] = result
+        checkpoint_pending += 1
+        if checkpoint_pending >= CHECKPOINT_INTERVAL:
+            save_results_cache(cache_path, list(checkpoint_by_code.values()))
+            checkpoint_pending = 0
+
     # ============== 阶段一: Datayes 基金合同 ==============
     t0 = time.time()
-    print(f"\n{'='*60}", flush=True)
-    print(f"[阶段一] Datayes 基金合同", flush=True)
-    print(f"{'='*60}", flush=True)
+    s1_classified = []
+    s1_not_found = []
+    if pending_funds:
+        print(f"\n{'='*60}", flush=True)
+        print("[阶段一] Datayes 基金合同", flush=True)
+        print(f"{'='*60}", flush=True)
+        s1_classified, s1_not_found = run_stage_1_2(
+            pending_funds,
+            pdf_dir,
+            stage=1,
+            on_result=checkpoint_result,
+        )
+    else:
+        print("\n[阶段一] 无需执行(全部命中结果缓存)", flush=True)
 
-    s1_classified, s1_not_found = run_stage_1_2(funds, pdf_dir, stage=1)
-
+    save_results_cache(cache_path, list(checkpoint_by_code.values()))
     if s1_not_found:
         print(f"\n  → 阶段一未分类: {len(s1_not_found)} 只", flush=True)
-    else:
-        print(f"\n  → 阶段一全部完成!", flush=True)
+    elif pending_funds:
+        print("\n  → 阶段一全部完成!", flush=True)
 
     # ============== 阶段二: 替代公告源 ==============
     s2_classified = []
     s2_not_found = []
-
     if s1_not_found:
         print(f"\n{'='*60}", flush=True)
         print(f"[阶段二] 替代公告源 (处理 {len(s1_not_found)} 只未分类)", flush=True)
         print(f"{'='*60}", flush=True)
-
         s2_classified, s2_not_found = run_stage_1_2(
-            s1_not_found, pdf_dir, stage=2
+            s1_not_found,
+            pdf_dir,
+            stage=2,
+            on_result=checkpoint_result,
         )
+        save_results_cache(cache_path, list(checkpoint_by_code.values()))
     else:
-        print(f"\n[阶段二] 无需执行(阶段一已全覆盖)", flush=True)
+        print("\n[阶段二] 无需执行(阶段一或缓存已全覆盖)", flush=True)
 
     # ============== 阶段三: CSRC 兜底 ==============
     s3_classified = []
     s3_not_found = []
+    s3_candidates = filter_unclassified_funds(
+        s2_not_found,
+        cached_results,
+        s1_classified,
+        s2_classified,
+    )
 
-    if s2_not_found and not args.skip_stage3:
+    if s3_candidates and not args.skip_stage3:
         print(f"\n{'='*60}", flush=True)
-        print(f"[阶段三] CSRC 证监会兜底 (处理 {len(s2_not_found)} 只未分类)", flush=True)
+        print(
+            f"[阶段三] CSRC 证监会兜底 (仅处理 {len(s3_candidates)} 只未分类)",
+            flush=True,
+        )
         print(f"{'='*60}", flush=True)
-
-        s3_classified, s3_not_found = run_stage_3(s2_not_found, pdf_dir)
-
+        s3_classified, s3_not_found = run_stage_3(
+            s3_candidates,
+            pdf_dir,
+            on_result=checkpoint_result,
+        )
+        save_results_cache(cache_path, list(checkpoint_by_code.values()))
     elif args.skip_stage3:
-        print(f"\n[阶段三] 已跳过 (--skip-stage3)", flush=True)
-        s3_not_found = s2_not_found
+        print("\n[阶段三] 已跳过 (--skip-stage3)", flush=True)
+        s3_not_found = s3_candidates
     else:
-        print(f"\n[阶段三] 无需执行(阶段二已全覆盖)", flush=True)
+        print("\n[阶段三] 无需执行(没有仍未分类的基金)", flush=True)
 
     # ============== 合并结果 ==============
-    all_results = s1_classified + s2_classified + s3_classified
-
-    # 补充未分类基金信息
-    for f_tuple in s3_not_found:
-        code, name, mgr, type1, type2 = f_tuple
-        all_results.append(
-            {
-                "code": code,
-                "name": name,
-                "mgr": mgr,
-                "type1": type1,
-                "type2": type2,
-                "clauseType": None,
-                "clauseText": "",
-                "s3Url": "",
-                "source": "",
-                "stage": 3,
-                "reason": "三阶段均未成功分类",
-            }
-        )
-
-    # 保存中间结果
-    with open(cache_path, "w", encoding="utf-8") as f:
-        json.dump(all_results, f, ensure_ascii=False, indent=2)
+    all_results = (
+        cached_results
+        + s1_classified
+        + s2_classified
+        + s3_classified
+        + [make_unclassified_result(fund) for fund in s3_not_found]
+    )
+    result_by_code = {result["code"]: result for result in all_results}
+    all_results = [
+        result_by_code[fund[0]] for fund in funds if fund[0] in result_by_code
+    ]
+    save_results_cache(cache_path, all_results)
 
     # ============== 生成 Excel ==============
     elapsed = time.time() - t0
     print(f"\n{'='*60}", flush=True)
-    print(f"生成最终 Excel...", flush=True)
+    print("生成最终 Excel...", flush=True)
     print(f"{'='*60}", flush=True)
 
     generate(output_path, all_results)
@@ -222,19 +363,20 @@ def main():
 
     # ============== 摘要 ==============
     total = len(all_results)
-    classified = sum(1 for r in all_results if r.get("clauseType"))
+    classified = sum(1 for result in all_results if result.get("clauseType"))
     classified_pct = classified / total * 100 if total else 0
     print(f"\n{'='*60}", flush=True)
-    print(f"最终统计", flush=True)
+    print("最终统计", flush=True)
     print(f"{'='*60}", flush=True)
-    print(f"  阶段一(Datayes基金合同): {len(s1_classified)} 只", flush=True)
-    print(f"  阶段二(替代公告源):     {len(s2_classified)} 只", flush=True)
-    print(f"  阶段三(CSRC证监会):     {len(s3_classified)} 只", flush=True)
-    print(f"  ─────────────────────", flush=True)
-    print(f"  可自动分类:             {classified}/{total} ({classified_pct:.1f}%)", flush=True)
-    print(f"  未分类:                 {len(s3_not_found)} 只", flush=True)
+    print(f"  缓存复用:                  {len(cached_results)} 只", flush=True)
+    print(f"  阶段一(Datayes基金合同):   {len(s1_classified)} 只", flush=True)
+    print(f"  阶段二(替代公告源):        {len(s2_classified)} 只", flush=True)
+    print(f"  阶段三(CSRC证监会):        {len(s3_classified)} 只", flush=True)
+    print("  ─────────────────────", flush=True)
+    print(f"  可自动分类:                {classified}/{total} ({classified_pct:.1f}%)", flush=True)
+    print(f"  未分类:                    {len(s3_not_found)} 只", flush=True)
     if s3_not_found:
-        not_found_codes = [f[0] for f in s3_not_found]
+        not_found_codes = [fund[0] for fund in s3_not_found]
         print(f"  未分类代码: {', '.join(not_found_codes)}", flush=True)
     print(f"  输出文件: {output_path}", flush=True)
     print(f"{'='*60}", flush=True)
