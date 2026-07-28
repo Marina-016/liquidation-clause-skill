@@ -1,0 +1,5 @@
+openpyxl
+requests
+PyMuPDF
+pypdf
+pikepdf

@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+
+# Runtime inputs and outputs
+contract_pdfs/
+results_cache.json
+*.xlsx
