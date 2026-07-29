@@ -21,8 +21,8 @@ ALLOWED_HOSTS = {
     "r.datayes.com",
     "bigdata-s3.wmcloud.com",
 }
-API_WORKERS = 16
-DL_WORKERS = 16
+API_WORKERS = 24
+DL_WORKERS = 24
 PARSE_WORKERS = 8
 
 # ============== S3 下载 ==============

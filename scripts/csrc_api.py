@@ -15,7 +15,7 @@ from classifier import classify
 # Suppress pypdf noise
 logging.disable(logging.CRITICAL)
 
-CSRC_WORKERS = 8  # 并行数
+CSRC_WORKERS = 10  # 并行数
 CSRC_START_DATE = "2000-01-01"
 CSRC_PAGE_SIZE = 50
 CSRC_MAX_PAGES = 20
