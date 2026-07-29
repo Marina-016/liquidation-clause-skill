@@ -6,11 +6,11 @@
 三种类型定义:
   类型1: 20日披露 + 60日向证监会报告+提方案+召开持有人大会(无时限)
   类型2: 20日披露 + 60日内10个工作日报告 + 6个月内召开持有人大会
-  类型3: 20日披露 + 50日直接终止 + 不需召开持有人大会
+  类型3: 20日披露 + 50日或60日直接终止 + 不需召开持有人大会
 
 关键区分:
   T1 vs T2: 是否同时存在报告和大会时限
-  T3: 50日 + 自动终止 + 不需召开大会(非60日)
+  T3: 50日或60日 + 终止/清算 + 不需召开大会
 """
 
 import re
@@ -38,7 +38,8 @@ def _number_pattern(arabic: str, chinese: str, stage: int) -> str:
 
 def _working_day_pattern(number_pattern: str, stage: int) -> str:
     suffix = r"个工作日" if stage < 3 else r"个?工作日"
-    return rf"{number_pattern}{suffix}"
+    artifact_gap = "" if stage == 1 else r".{0,80}?"
+    return rf"{number_pattern}(?![0０]){artifact_gap}{suffix}"
 
 
 def _is_linked(
@@ -73,31 +74,54 @@ def _features_for_context(context: str, stage: int) -> dict:
     day_20 = _working_day_pattern(
         _number_pattern(r"[2２][0０]", "二十", stage), stage
     )
+    deadline_number_stage = max(stage, 2)
     day_50 = _working_day_pattern(
-        _number_pattern(r"[5５][0０]", "五十", stage), stage
+        _number_pattern(r"[5５][0０]", "五十", deadline_number_stage), stage
     )
     day_60 = _working_day_pattern(
-        _number_pattern(r"[6６][0０]", "六十", stage), stage
+        _number_pattern(r"[6６][0０]", "六十", deadline_number_stage), stage
     )
+    artifact_gap = "" if stage == 1 else r".{0,80}?"
     people_200 = (
-        _number_pattern(r"[2２][0０][0０]", "二百", stage) + r"人"
+        _number_pattern(r"[2２][0０][0０]", "二百", stage)
+        + r"(?![0０])"
+        + artifact_gap
+        + r"人"
+    )
+    people_100 = (
+        _number_pattern(r"[1１][0０][0０]", "一百", stage)
+        + r"(?![0０])"
+        + artifact_gap
+        + r"人"
+    )
+    people_threshold = (
+        rf"(?:{people_200}|{people_100})" if stage == 3 else people_200
     )
     amount_5000 = (
-        _number_pattern(r"[5５](?:[,，]?[0０]{3})", "五千", stage) + r"万元?"
+        _number_pattern(r"[5５](?:[,，]?[0０]{3})", "五千", stage)
+        + r"万元?"
     )
     day_10 = _working_day_pattern(
-        _number_pattern(r"[1１][0０]", "十", stage), stage
-    ) + r"内"
-    month_6 = _number_pattern(r"[6６]", "六", stage) + r"个月内"
+        _number_pattern(r"[1１][0０]", "十", deadline_number_stage), stage
+    ) + (r"内" if stage == 1 else r"内?")
+    month_6 = (
+        _number_pattern(r"[6６]", "六", deadline_number_stage)
+        + artifact_gap
+        + r"个月内"
+    )
 
     regulator = r"(?:中国证监会|中国证券监督管理委员会|证监会|CSRC)"
-    report = rf"(?:报告(?:至|给)?{regulator}|(?:向|报送至)?{regulator}(?:报告|报送))"
-    solution = r"(?:提出|制定)(?:相应的?)?(?:解决|处置|应对)方案"
-    meeting = r"(?:召集|召开)(?:本?基金)?份额持有人大会"
-    no_meeting = r"(?:不需|无需|不需要|无须)召开(?:本?基金)?份额持有人大会"
-    auto_termination = (
-        r"(?:(?:本?基金合同).{0,12}(?:(?:自动|直接|应当)?终止|进入清算程序)|"
-        r"(?:自动|直接|应当).{0,12}(?:本?基金合同)?终止)"
+    report = rf"(?:报告(?:至|给)?{regulator}|(?:向|报送至)?{regulator}(?:报告|报送|备案|说明原因)|报{regulator}(?:备案)?)"
+    solution = r"(?:(?:提出|制定|报送)(?:相应的?)?)?(?:解决|处置|应对)方案"
+    holder = r"(?:本?基金)?(?:份额)?持有" + artifact_gap + r"人大会"
+    meeting = rf"(?:召集|召开){artifact_gap}{holder}"
+    no_meeting = rf"(?:不需|无需|不需要|无须|不必){artifact_gap}(?:召集|召开)?{artifact_gap}{holder}"
+    termination = (
+        r"(?:终止(?:本)?(?:《?基金合同》?|合同)|"
+        r"(?:本?《?基金合同》?).{0,80}?终止|"
+        r"(?:本基金|基金管理人).{0,50}?(?:宣布基金)?终止|"
+        r"(?:进入|进行|履行).{0,80}?(?:基金财产)?清算(?:程序)?|"
+        r"(?:基金财产)?清算.{0,80}?终止)"
     )
 
     features = {
@@ -105,7 +129,7 @@ def _features_for_context(context: str, stage: int) -> dict:
         "has_20": bool(re.search(day_20, context)),
         "has_50": bool(re.search(day_50, context)),
         "has_60": bool(re.search(day_60, context)),
-        "has_200": bool(re.search(people_200, context)),
+        "has_200": bool(re.search(people_threshold, context)),
         "has_5000": bool(re.search(amount_5000, context)),
         "has_6month": bool(re.search(month_6, context)),
         "has_10days": bool(re.search(day_10, context)),
@@ -113,7 +137,7 @@ def _features_for_context(context: str, stage: int) -> dict:
         "has_solution": bool(re.search(solution, context)),
         "has_meeting": bool(re.search(meeting, context)),
         "has_no_meeting": bool(re.search(no_meeting, context)),
-        "has_auto_termination": bool(re.search(auto_termination, context)),
+        "has_auto_termination": bool(re.search(termination, context)),
         "stage": stage,
     }
 
@@ -121,39 +145,60 @@ def _features_for_context(context: str, stage: int) -> dict:
     type_2_chain = False
     type_3_chain = False
 
-    for trigger in re.finditer(day_60, context):
-        window = _bounded_window(context, trigger.start(), 350)
-        linked_report_deadline = _is_linked(window, day_10, report)
-        linked_meeting_deadline = _is_linked(window, month_6, meeting)
-
-        if linked_report_deadline and linked_meeting_deadline:
-            type_2_chain = True
-
-        if (
-            _is_linked(window, report, solution, max_gap=120)
-            and _is_linked(window, solution, meeting, max_gap=180)
-            and not linked_report_deadline
-            and not linked_meeting_deadline
-        ):
-            type_1_chain = True
-
-    for trigger in re.finditer(day_50, context):
-        window = _bounded_window(context, trigger.start(), 250)
-        if (
-            re.search(auto_termination, window)
-            and re.search(no_meeting, window)
-            and (
-                _is_linked(window, auto_termination, no_meeting, max_gap=120)
-                or _is_linked(window, no_meeting, auto_termination, max_gap=120)
+    for trigger_pattern in (day_50, day_60):
+        for trigger in re.finditer(trigger_pattern, context):
+            sentence = _sentence_around(context, trigger.start(), trigger.end())
+            legacy_direct = (
+                stage == 3
+                and re.search(people_100, context)
+                and re.search(regulator, sentence)
             )
-        ):
-            type_3_chain = True
+            if re.search(termination, sentence) and (
+                re.search(no_meeting, sentence) or legacy_direct
+            ):
+                type_3_chain = True
+                continue
+
+            boundary = HARD_BOUNDARY_RE.search(context, trigger.end())
+            if boundary and re.search(termination, sentence):
+                next_sentence = _bounded_window(
+                    context,
+                    boundary.end(),
+                    350,
+                )
+                continuation = r"^(?:由)?(?:上述|前述|该|此)情形"
+                if (
+                    re.search(continuation, next_sentence)
+                    and re.search(no_meeting, next_sentence)
+                ):
+                    type_3_chain = True
+
+    for trigger_pattern in (day_50, day_60):
+        for trigger in re.finditer(trigger_pattern, context):
+            window = _bounded_window(context, trigger.start(), 700)
+            linked_report_deadline = bool(
+                re.search(day_10, window) and re.search(report, window)
+            )
+            linked_meeting_deadline = bool(
+                re.search(month_6, window) and re.search(meeting, window)
+            )
+
+            if linked_report_deadline and linked_meeting_deadline:
+                type_2_chain = True
+            elif re.search(report, window) and (
+                re.search(solution, window)
+                or re.search(meeting, window)
+                or "备案" in window
+            ):
+                type_1_chain = True
+    if not features["has_50"] and not features["has_60"]:
+        if re.search(report, context) and re.search(solution, context):
+            type_1_chain = True
 
     features["type_1_chain"] = type_1_chain
     features["type_2_chain"] = type_2_chain
     features["type_3_chain"] = type_3_chain
     return features
-
 
 def classify(text: str, stage: int = 1) -> tuple:
     """
@@ -174,8 +219,21 @@ def classify(text: str, stage: int = 1) -> tuple:
     amount_5000 = (
         _number_pattern(r"[5５](?:[,，]?[0０]{3})", "五千", stage) + r"万元?"
     )
+    artifact_gap = "" if stage == 1 else r".{0,80}?"
     people_200 = (
-        _number_pattern(r"[2２][0０][0０]", "二百", stage) + r"人"
+        _number_pattern(r"[2２][0０][0０]", "二百", stage)
+        + r"(?![0０])"
+        + artifact_gap
+        + r"人"
+    )
+    people_100 = (
+        _number_pattern(r"[1１][0０][0０]", "一百", stage)
+        + r"(?![0０])"
+        + artifact_gap
+        + r"人"
+    )
+    people_threshold = (
+        rf"(?:{people_200}|{people_100})" if stage == 3 else people_200
     )
 
     day_20 = _working_day_pattern(
@@ -188,9 +246,19 @@ def classify(text: str, stage: int = 1) -> tuple:
         start = max(0, match.start() - 500)
         end = min(len(text_clean), match.end() + 900)
         base_clause = _sentence_around(text_clean, match.start(), match.end())
-        if not (
+        has_holder_label = (
             "份额持有人" in base_clause
-            and re.search(people_200, base_clause)
+            or (
+                stage == 3
+                and (
+                    "基金持有人" in base_clause
+                    or "基金的持有人" in base_clause
+                )
+            )
+        )
+        if not (
+            has_holder_label
+            and re.search(people_threshold, base_clause)
             and re.search(day_20, base_clause)
         ):
             continue

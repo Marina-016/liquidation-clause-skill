@@ -166,8 +166,14 @@ def generate(output_path: str, results: list):
 
     s1 = sum(1 for r in results if r.get("stage") == 1 and ct(r))
     s2 = sum(1 for r in results if r.get("stage") == 2 and ct(r))
+    s2_contract = sum(
+        1
+        for r in results
+        if r.get("stage") == 2
+        and r.get("source") == "基金合同(宽松复判)"
+    )
+    s2_alternative = s2 - s2_contract
     s3 = sum(1 for r in results if r.get("stage") == 3 and ct(r))
-
     notes = [
         ("统计范围", f"共 {total} 只基金，{len(mgrs)} 家管理人。"),
         (
@@ -180,7 +186,8 @@ def generate(output_path: str, results: list):
         (
             "分阶段统计",
             f"阶段一(Datayes基金合同): {s1}只 | "
-            f"阶段二(替代公告源): {s2}只 | "
+            f"阶段二A(同合同宽松复判): {s2_contract}只 | "
+            f"阶段二B(替代公告源): {s2_alternative}只 | "
             f"阶段三(CSRC证监会): {s3}只",
         ),
         (
@@ -190,15 +197,15 @@ def generate(output_path: str, results: list):
         ),
         (
             "类型1: 备案",
-            "连续20个工作日持有人<200人或净值<5,000万→定期报告披露；连续60个工作日→向证监会报告并提出解决方案(转换/合并/终止)，召开持有人大会表决。"
+            "向证监会报告并提交解决方案，但未同时出现10日报告和6个月大会，且不属于直接终止。"
         ),
         (
             "类型2: 备案+6个月大会",
-            "同类型1的20→60日链路，并明确'10个工作日内向中国证监会报告'及'6个月内召集基金份额持有人大会'。"
+            "连续50或60个工作日触发后，同时明确10个工作日内报告及6个月内召集基金份额持有人大会。"
         ),
         (
             "类型3: 自动触发终止",
-            "连续50(或60)个工作日触发后→基金合同自动/直接终止，无需召开基金份额持有人大会。"
+            "连续50或60个工作日触发后直接终止/清算且无需大会；阶段三兼容100人门槛旧契约。"
         ),
         (
             "解析引擎",

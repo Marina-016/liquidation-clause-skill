@@ -16,6 +16,10 @@ from classifier import classify
 logging.disable(logging.CRITICAL)
 
 CSRC_WORKERS = 8  # 并行数
+CSRC_START_DATE = "2000-01-01"
+CSRC_PAGE_SIZE = 50
+CSRC_MAX_PAGES = 20
+CSRC_CODE_ALIASES = {"151002": ("151001",)}
 
 CSRC_SEARCH_URL = (
     "http://eid.csrc.gov.cn/fund/disclose/advanced_search_report.do"
@@ -32,25 +36,41 @@ def validate_url(url: str) -> None:
         raise ValueError(f"Untrusted host: {host}")
 
 
-def search_csrc(fund_code: str, report_type: str = "FA020010") -> dict | None:
-    """
-    在 CSRC 搜索基金合同/招募说明书。
+def _candidate_title_score(name: str, report_type: str) -> int:
+    """完整合同/招募说明书优先，费率调整及修改公告降至末尾。"""
+    compact = "".join(str(name or "").split())
+    score = 0
+    if report_type == "FA020010":
+        if "基金合同" in compact:
+            score += 200
+        if compact.endswith("基金合同"):
+            score += 100
+        if compact.endswith(("基金合同（修订版）", "基金合同(修订版)")):
+            score += 90
+        if "修订" in compact or "更新" in compact:
+            score += 10
+    elif "招募说明书" in compact:
+        score += 150
 
-    Args:
-        fund_code: 6位基金代码
-        report_type: FA020010(基金合同) 或 FA010010(招募说明书)
+    if "公告" in compact:
+        score -= 300
+    if any(word in compact for word in ("降低费率", "调低费率", "费率调整", "修改公告", "摘要")):
+        score -= 200
+    return score
 
-    Returns:
-        {"uploadId": ..., "name": ...} 或 None
-    """
-    # 构建 DataTables aoData
+
+def _build_search_payload(
+    fund_code: str,
+    report_type: str,
+    display_start: int,
+) -> str:
     now = time.strftime("%Y-%m-%d")
     ao_items = [
         {"name": "sEcho", "value": "1"},
         {"name": "iColumns", "value": "6"},
         {"name": "sColumns", "value": ",,,,,,"},
-        {"name": "iDisplayStart", "value": "0"},
-        {"name": "iDisplayLength", "value": "5"},
+        {"name": "iDisplayStart", "value": str(display_start)},
+        {"name": "iDisplayLength", "value": str(CSRC_PAGE_SIZE)},
         {"name": "mDataProp_0", "value": "fundCode"},
         {"name": "mDataProp_1", "value": "fundId"},
         {"name": "mDataProp_2", "value": "reportName"},
@@ -63,57 +83,42 @@ def search_csrc(fund_code: str, report_type: str = "FA020010") -> dict | None:
         {"name": "fundCompanyShortName", "value": ""},
         {"name": "fundCode", "value": fund_code},
         {"name": "fundShortName", "value": ""},
-        {"name": "startUploadDate", "value": "2019-01-01"},
+        {"name": "startUploadDate", "value": CSRC_START_DATE},
         {"name": "endUploadDate", "value": now},
     ]
+    return json.dumps(ao_items, ensure_ascii=False, separators=(",", ":"))
 
-    ao_data = json.dumps(ao_items, ensure_ascii=False, separators=(",", ":"))
 
-    # 用 PowerShell 搜索(Win), 或 python requests 兜底
+def _fetch_search_page(ao_data: str) -> dict:
+    search_url = f"{CSRC_SEARCH_URL}?aoData="
+    validate_url(search_url)
+    errors = []
+
     try:
-        # PowerShell path (Windows)
-        search_url = f"{CSRC_SEARCH_URL}?aoData="
-        validate_url(search_url)
         ps_script = f'''
 Add-Type -AssemblyName System.Web
 $aoData = '{ao_data}'
 $encoded = [System.Web.HttpUtility]::UrlEncode($aoData)
 $url = "{CSRC_SEARCH_URL}?aoData=" + $encoded
-$resp = Invoke-WebRequest -Uri $url -Method GET -TimeoutSec 15 -UseBasicParsing
+$resp = Invoke-WebRequest -Uri $url -Method GET -TimeoutSec 20 -UseBasicParsing
 $resp.Content
 '''
         proc = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps_script],
             capture_output=True,
-            timeout=20,
+            timeout=25,
         )
-        # Handle both bytes and str (depends on text= param)
         stdout = proc.stdout
         if isinstance(stdout, bytes):
-            try:
-                stdout = stdout.decode("utf-8")
-            except UnicodeDecodeError:
-                try:
-                    stdout = stdout.decode("gbk")
-                except UnicodeDecodeError:
-                    stdout = stdout.decode("utf-8", errors="replace")
+            stdout = stdout.decode("utf-8", errors="replace")
         if stdout and stdout.strip():
-            data = json.loads(stdout.strip())
-        else:
-            raise ValueError("empty stdout")
-        if data.get("iTotalRecords", 0) > 0 and data.get("aaData"):
-            item = data["aaData"][0]
-            return {
-                "uploadId": item.get("uploadInfoId"),
-                "name": item.get("reportName", ""),
-                "rt": report_type,
-            }
-    except Exception:
-        pass
+            return json.loads(stdout.strip())
+        errors.append("PowerShell返回空响应")
+    except Exception as exc:
+        errors.append(f"PowerShell: {exc}")
 
-    # Fallback: python requests
     try:
-        import urllib.request, urllib.parse
+        import urllib.request
 
         encoded = urllib.parse.quote(ao_data, safe="")
         url = f"{CSRC_SEARCH_URL}?aoData={encoded}"
@@ -126,19 +131,71 @@ $resp.Content
                 "X-Requested-With": "XMLHttpRequest",
             },
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
-            if data.get("iTotalRecords", 0) > 0 and data.get("aaData"):
-                item = data["aaData"][0]
-                return {
-                    "uploadId": item.get("uploadInfoId"),
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read())
+    except Exception as exc:
+        errors.append(f"urllib: {exc}")
+
+    raise RuntimeError("；".join(errors))
+
+
+def search_csrc_candidates(
+    fund_code: str,
+    report_type: str = "FA020010",
+) -> list:
+    """查询并返回排序、去重后的全部 CSRC 文档候选。"""
+    candidates = []
+    seen_ids = set()
+
+    for page in range(CSRC_MAX_PAGES):
+        display_start = page * CSRC_PAGE_SIZE
+        ao_data = _build_search_payload(fund_code, report_type, display_start)
+        data = _fetch_search_page(ao_data)
+        records = data.get("aaData") or []
+
+        for item in records:
+            upload_id = item.get("uploadInfoId")
+            if not upload_id or upload_id in seen_ids:
+                continue
+            seen_ids.add(upload_id)
+            candidates.append(
+                {
+                    "uploadId": upload_id,
                     "name": item.get("reportName", ""),
+                    "reportSendDate": item.get("reportSendDate", ""),
                     "rt": report_type,
                 }
-    except Exception:
-        pass
+            )
 
-    return None
+        total = int(data.get("iTotalRecords") or 0)
+        if not records or display_start + len(records) >= total:
+            break
+
+    candidates.sort(
+        key=lambda item: (
+            _candidate_title_score(item.get("name", ""), report_type),
+            str(item.get("reportSendDate", "")),
+            int(item.get("uploadId") or 0),
+        ),
+        reverse=True,
+    )
+    return candidates
+
+
+def search_csrc(fund_code: str, report_type: str = "FA020010") -> dict | None:
+    """兼容旧调用：返回排序后的首个 CSRC 候选。"""
+    candidates = search_csrc_candidates(fund_code, report_type)
+    return candidates[0] if candidates else None
+
+
+def _is_pdf_file(path: str) -> bool:
+    try:
+        if os.path.getsize(path) <= 1000:
+            return False
+        with open(path, "rb") as handle:
+            return handle.read(5) == b"%PDF-"
+    except OSError:
+        return False
 
 
 def download_csrc_pdf(upload_id: int, out_dir: str) -> str | None:
@@ -153,7 +210,7 @@ def download_csrc_pdf(upload_id: int, out_dir: str) -> str | None:
         本地 PDF 路径 或 None
     """
     dest = os.path.join(out_dir, f"csrc_{upload_id}.pdf")
-    if os.path.exists(dest) and os.path.getsize(dest) > 1000:
+    if os.path.exists(dest) and _is_pdf_file(dest):
         return dest
 
     pdf_url = f"{CSRC_PDF_URL}?instanceid={upload_id}"
@@ -172,7 +229,7 @@ Invoke-WebRequest -Uri $url -OutFile $dest -TimeoutSec 30 -UseBasicParsing -Head
             capture_output=True,
             timeout=35,
         )
-        if os.path.exists(dest) and os.path.getsize(dest) > 1000:
+        if os.path.exists(dest) and _is_pdf_file(dest):
             return dest
     except Exception:
         pass
@@ -191,7 +248,7 @@ Invoke-WebRequest -Uri $url -OutFile $dest -TimeoutSec 30 -UseBasicParsing -Head
         with urllib.request.urlopen(req, timeout=30) as resp:
             with open(dest, "wb") as f:
                 f.write(resp.read())
-        if os.path.getsize(dest) > 1000:
+        if _is_pdf_file(dest):
             return dest
     except Exception:
         pass
@@ -215,16 +272,7 @@ def parse_csrc_pdf(pdf_path: str) -> str | None:
 def process_fund_csrc(
     fund: tuple, out_dir: str, verbose: bool = True
 ) -> dict:
-    """
-    处理单只基金: CSRC 搜索 → 下载 → pypdf 解析 → 分类
-
-    Args:
-        fund: (code, name, mgr, type1, type2)
-        out_dir: 输出目录
-
-    Returns:
-        结果 dict (与 datayes_api 同结构)
-    """
+    """依次尝试 CSRC 的完整合同与招募说明书候选，直到成功分类。"""
     code, name, mgr, type1, type2 = fund
     result = {
         "code": code,
@@ -239,65 +287,155 @@ def process_fund_csrc(
         "stage": 3,
         "reason": "",
     }
+    candidate_attempts = []
 
-    # Step 1: 搜索 CSRC (先基金合同, 再招募说明书)，每条路径最多重试 2 次
-    for rt, label in [("FA020010", "基金合同"), ("FA010010", "招募说明书")]:
-        for attempt in range(2):  # 最多重试2次
-            search_result = search_csrc(code, rt)
-            if search_result:
-                break
-            if attempt == 0:
-                time.sleep(0.5)  # 重试前等待
+    for report_type, label in [
+        ("FA020010", "基金合同"),
+        ("FA010010", "招募说明书"),
+    ]:
+        candidates = []
+        query_errors = []
+        seen_ids = set()
+        search_codes = (code,) + CSRC_CODE_ALIASES.get(code, ())
 
-        if not search_result:
+        for search_code in search_codes:
+            found = None
+            query_error = None
+            for attempt in range(2):
+                try:
+                    found = search_csrc_candidates(search_code, report_type)
+                    query_error = None
+                    break
+                except Exception as exc:
+                    query_error = exc
+                    if attempt == 0:
+                        time.sleep(0.5)
+
+            if query_error is not None:
+                query_errors.append(f"{search_code}: {query_error}")
+                continue
+
+            for candidate in found or []:
+                if search_code != code and "系列" not in candidate.get("name", ""):
+                    continue
+                upload_id = candidate.get("uploadId")
+                if upload_id in seen_ids:
+                    continue
+                seen_ids.add(upload_id)
+                enriched = dict(candidate)
+                enriched["searchCode"] = search_code
+                candidates.append(enriched)
+
+        candidates.sort(
+            key=lambda item: (
+                _candidate_title_score(item.get("name", ""), report_type),
+                str(item.get("reportSendDate", "")),
+            ),
+            reverse=True,
+        )
+
+        if not candidates:
+            status = "CSRC_QUERY_ERROR" if query_errors else "CSRC_NO_RECORDS"
+            detail = (
+                "；".join(query_errors)
+                if query_errors
+                else f"{CSRC_START_DATE}以来无记录"
+            )
+            candidate_attempts.append(
+                {
+                    "reportType": report_type,
+                    "status": status,
+                    "detail": detail,
+                }
+            )
             continue
+        for candidate in candidates:
+            upload_id = candidate["uploadId"]
+            attempt_record = {
+                "reportType": report_type,
+                "uploadId": upload_id,
+                "name": candidate.get("name", ""),
+                "searchCode": candidate.get("searchCode", code),
+            }
 
-        upload_id = search_result["uploadId"]
+            pdf_path = None
+            for attempt in range(2):
+                pdf_path = download_csrc_pdf(upload_id, out_dir)
+                if pdf_path:
+                    break
+                if attempt == 0:
+                    time.sleep(0.5)
+            if not pdf_path:
+                attempt_record["status"] = "CSRC_DOWNLOAD_FAILED"
+                candidate_attempts.append(attempt_record)
+                continue
 
-        # Step 2: 下载 (最多重试2次)
-        pdf_path = None
-        for attempt in range(2):
-            pdf_path = download_csrc_pdf(upload_id, out_dir)
-            if pdf_path:
-                break
-            if attempt == 0:
-                time.sleep(0.5)
+            try:
+                text = parse_csrc_pdf(pdf_path)
+            except Exception as exc:
+                attempt_record["status"] = "CSRC_PARSE_EMPTY"
+                attempt_record["detail"] = str(exc)
+                candidate_attempts.append(attempt_record)
+                continue
+            if not text:
+                attempt_record["status"] = "CSRC_PARSE_EMPTY"
+                candidate_attempts.append(attempt_record)
+                continue
+            compact_text = re.sub(r"\s+", "", text)
+            if not any(
+                marker in compact_text
+                for marker in ("基金合同", "基金契约", "基金备案")
+            ):
+                attempt_record["status"] = "CSRC_DOCUMENT_MISMATCH"
+                candidate_attempts.append(attempt_record)
+                continue
 
-        if not pdf_path:
-            continue
+            clause_type, clause_text, detail = classify(text, stage=3)
+            pdf_url = f"{CSRC_PDF_URL}?instanceid={upload_id}"
+            result["clauseText"] = text_preview(clause_text)
+            result["s3Url"] = pdf_url
+            result["source"] = f"CSRC证监会({label})"
 
-        # Step 3: pypdf 解析
-        text = parse_csrc_pdf(pdf_path)
-        if not text:
-            continue
+            if clause_type:
+                result["clauseType"] = clause_type
+                attempt_record["status"] = "CSRC_CLASSIFIED"
+                attempt_record["clauseType"] = clause_type
+                candidate_attempts.append(attempt_record)
+                result["candidateAttempts"] = candidate_attempts
+                if verbose:
+                    print(f"  {code}: {clause_type} [CSRC {label}]")
+                return result
 
-        # 验证确实是基金合同(含关键词)
-        if "基金合同" not in text and "基金备案" not in text:
-            continue
-
-        # Step 4: 分类
-        clause_type, clause_text, detail = classify(text, stage=3)
-        result["clauseText"] = text_preview(clause_text)
-        result["s3Url"] = f"{CSRC_PDF_URL}?instanceid={upload_id}"
-        result["source"] = f"CSRC证监会({label})"
-
-        if clause_type:
-            result["clauseType"] = clause_type
-            if verbose:
-                print(f"  {code}: {clause_type} [CSRC {label}]")
-            return result
-        else:
-            if verbose:
-                print(
-                    f"  {code}: 未匹配 [CSRC {label}] "
-                    f"(h20={detail.get('has_20')} h60={detail.get('has_60')} "
-                    f"no_meet={detail.get('has_no_meeting')} 6m={detail.get('has_6month')})"
+            attempt_record["status"] = "CSRC_RULE_NO_MATCH"
+            attempt_record["detail"] = {
+                key: detail.get(key)
+                for key in (
+                    "anchor",
+                    "has_20",
+                    "has_50",
+                    "has_60",
+                    "has_10days",
+                    "has_6month",
+                    "has_report",
+                    "has_no_meeting",
+                    "has_auto_termination",
                 )
+            }
+            candidate_attempts.append(attempt_record)
 
-    # 两条路径都未找到
-    result["reason"] = "阶段3: CSRC两路(基金合同+招募说明书)均未找到可用文档"
+    result["candidateAttempts"] = candidate_attempts
+    status_counts = {}
+    for attempt in candidate_attempts:
+        status = attempt.get("status", "UNKNOWN")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    summary = ", ".join(
+        f"{status}={count}" for status, count in sorted(status_counts.items())
+    )
+    result["reason"] = (
+        f"阶段3: CSRC_ALL_CANDIDATES_EXHAUSTED ({summary or '无候选'})"
+    )
     if verbose:
-        print(f"  {code}: NOT FOUND (CSRC)")
+        print(f"  {code}: NOT FOUND (CSRC: {summary or '无候选'})")
     return result
 
 

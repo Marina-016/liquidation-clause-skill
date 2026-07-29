@@ -3,7 +3,8 @@
 """
 阶段一 & 阶段二: Datayes 数据源。
 阶段一: 基金合同(classifyName=基金合同) → PyMuPDF 解析 → 分类
-阶段二: 替代源(招募说明书/发售公告/成立公告/资料概要) → PyMuPDF解析 + pypdf兜底 → 分类
+阶段二A: 同一份完整基金合同 → PyMuPDF解析 + pypdf兜底 → 宽松分类
+阶段二B: 替代源(招募说明书/发售公告/成立公告/资料概要) → PyMuPDF解析 + pypdf兜底 → 分类
 """
 
 import os, sys, json, time, hashlib, urllib.request, urllib.parse
@@ -162,11 +163,33 @@ def parse_pdf(pdf_path, stage: int = 1):
 # ============== 合同查找 ==============
 
 
+def _contract_title_score(title: str):
+    """完整基金合同标题评分；公告、费率调整和修改说明不作为合同正文。"""
+    compact = "".join(str(title or "").split())
+    if "基金合同" not in compact or "摘要" in compact:
+        return None
+    if "公告" in compact:
+        return None
+    if compact.startswith("关于") and any(
+        marker in compact for marker in ("降低", "调低", "调整", "费率", "变更", "修改")
+    ):
+        return None
+
+    score = 100
+    if compact.endswith("基金合同"):
+        score += 100
+    if compact.endswith(("基金合同（修订版）", "基金合同(修订版)")):
+        score += 90
+    if "修订" in compact or "更新" in compact:
+        score += 10
+    return score
+
+
 def find_contract(fund_code, stage: int = 1):
     """
     查找基金合同/替代文档。
 
-    阶段一: 只取 classifyName="基金合同"，且优选标题不含"修订/修改/公告/摘要"的
+    阶段一: 只取 classifyName="基金合同"，按标题评分优选完整合同正文
     阶段二: 放宽到 招募说明书 > 发售公告 > 成立公告 > 资料概要 > 发行运作
 
     返回: {"s3Url": ..., "title": ..., "source": ...} 或 None
@@ -184,11 +207,11 @@ def find_contract(fund_code, stage: int = 1):
             if resp.get("code") != 1:
                 continue
 
-            best_contract = None
-            best_recruit = None  # 招募说明书
-            best_sale = None  # 发售/成立公告
-            best_summary = None  # 资料概要
-            best_operate = None  # 发行运作
+            contract_candidates = []
+            best_recruit = None
+            best_sale = None
+            best_summary = None
+            best_operate = None
 
             for item in resp["data"]["list"]:
                 title = item.get("title", "")
@@ -196,23 +219,16 @@ def find_contract(fund_code, stage: int = 1):
                 cid = str(item.get("classifyId", ""))
                 url = item["s3Url"]
 
-                # 阶段一: 严格限定基金合同
                 if stage == 1 and cn == "基金合同":
-                    info = {"s3Url": url, "title": title, "source": "基金合同"}
-                    if best_contract is None:
-                        best_contract = info
-                    # 优先选标题干净的完整合同
-                    if (
-                        "基金合同" in title
-                        and "修订" not in title
-                        and "调低" not in title
-                        and "修改" not in title
-                        and "公告" not in title
-                        and "摘要" not in title
-                    ):
-                        return info
+                    score = _contract_title_score(title)
+                    if score is not None:
+                        contract_candidates.append(
+                            (
+                                score,
+                                {"s3Url": url, "title": title, "source": "基金合同"},
+                            )
+                        )
 
-                # 阶段二: 放宽到所有可用文档
                 if stage == 2:
                     if "招募" in title and best_recruit is None:
                         best_recruit = {
@@ -239,9 +255,8 @@ def find_contract(fund_code, stage: int = 1):
                             "source": "发行运作",
                         }
 
-            # 按优先级返回
-            if best_contract:
-                return best_contract
+            if contract_candidates:
+                return max(contract_candidates, key=lambda candidate: candidate[0])[1]
             if stage == 2:
                 if best_recruit:
                     return best_recruit
@@ -251,12 +266,10 @@ def find_contract(fund_code, stage: int = 1):
                     return best_summary
                 if best_operate:
                     return best_operate
-
         except Exception:
             pass
 
     return None
-
 
 # ============== 单只基金处理 ==============
 
@@ -394,6 +407,8 @@ def run_stage(
     stage: int,
     verbose: bool = True,
     on_result=None,
+    document_stage: int = None,
+    source_override: str = None,
 ) -> tuple:
     """
     执行阶段 1 或 2，使用独立的 API、下载和解析线程池。
@@ -401,12 +416,18 @@ def run_stage(
     Args:
         funds: [(code, name, mgr, type1, type2), ...] 待处理基金列表
         out_dir: PDF 下载缓存目录
-        stage: 1 或 2
+        stage: 分类规则阶段，1 或 2
         on_result: 可选回调，每只基金完成后接收结果 dict
+        document_stage: 文档查找阶段；默认与 stage 相同
+        source_override: 可选的数据来源显示名称
 
     Returns:
         (classified_list, not_found_list)
     """
+    lookup_stage = stage if document_stage is None else document_stage
+    if lookup_stage not in (1, 2):
+        raise ValueError(f"unsupported document stage: {lookup_stage}")
+
     total = len(funds)
     if total == 0:
         if verbose:
@@ -448,7 +469,7 @@ def run_stage(
         ThreadPoolExecutor(max_workers=PARSE_WORKERS) as parse_executor,
     ):
         api_futures = {
-            api_executor.submit(find_contract, fund[0], stage): (index, fund)
+            api_executor.submit(find_contract, fund[0], lookup_stage): (index, fund)
             for index, fund in enumerate(funds)
         }
         download_futures = {}
@@ -480,7 +501,7 @@ def run_stage(
 
                     s3_url = contract["s3Url"]
                     result["s3Url"] = s3_url
-                    result["source"] = contract["source"]
+                    result["source"] = source_override or contract["source"]
 
                     if s3_url in payload_cache:
                         finalize(
