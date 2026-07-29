@@ -75,6 +75,9 @@ def _features_for_context(context: str, stage: int) -> dict:
         _number_pattern(r"[2２][0０]", "二十", stage), stage
     )
     deadline_number_stage = max(stage, 2)
+    day_30 = _working_day_pattern(
+        _number_pattern(r"[3３][0０]", "三十", deadline_number_stage), stage
+    )
     day_50 = _working_day_pattern(
         _number_pattern(r"[5５][0０]", "五十", deadline_number_stage), stage
     )
@@ -127,6 +130,7 @@ def _features_for_context(context: str, stage: int) -> dict:
     features = {
         "anchor": True,
         "has_20": bool(re.search(day_20, context)),
+        "has_30": bool(re.search(day_30, context)),
         "has_50": bool(re.search(day_50, context)),
         "has_60": bool(re.search(day_60, context)),
         "has_200": bool(re.search(people_threshold, context)),
@@ -145,7 +149,7 @@ def _features_for_context(context: str, stage: int) -> dict:
     type_2_chain = False
     type_3_chain = False
 
-    for trigger_pattern in (day_50, day_60):
+    for trigger_pattern in (day_30, day_50, day_60):
         for trigger in re.finditer(trigger_pattern, context):
             sentence = _sentence_around(context, trigger.start(), trigger.end())
             legacy_direct = (
@@ -173,7 +177,7 @@ def _features_for_context(context: str, stage: int) -> dict:
                 ):
                     type_3_chain = True
 
-    for trigger_pattern in (day_50, day_60):
+    for trigger_pattern in (day_30, day_50, day_60):
         for trigger in re.finditer(trigger_pattern, context):
             window = _bounded_window(context, trigger.start(), 700)
             linked_report_deadline = bool(
