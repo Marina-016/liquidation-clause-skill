@@ -110,7 +110,14 @@ $resp.Content
         )
         stdout = proc.stdout
         if isinstance(stdout, bytes):
-            stdout = stdout.decode("utf-8", errors="replace")
+            # CSRC 返回 GBK/GB2312, 先试 UTF-8 再试 GBK
+            try:
+                stdout = stdout.decode("utf-8")
+            except UnicodeDecodeError:
+                try:
+                    stdout = stdout.decode("gbk")
+                except UnicodeDecodeError:
+                    stdout = stdout.decode("utf-8", errors="replace")
         if stdout and stdout.strip():
             return json.loads(stdout.strip())
         errors.append("PowerShell返回空响应")

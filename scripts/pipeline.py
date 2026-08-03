@@ -15,7 +15,7 @@ import os, sys, json, time, argparse
 
 
 CACHE_SCHEMA_VERSION = 3
-PIPELINE_VERSION = "0.2.0"
+PIPELINE_VERSION = "0.2.1"
 CHECKPOINT_INTERVAL = 25
 
 

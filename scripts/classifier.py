@@ -105,8 +105,8 @@ def _features_for_context(context: str, stage: int) -> dict:
         + r"万元?"
     )
     day_10 = _working_day_pattern(
-        _number_pattern(r"[1１][0０]", "十", deadline_number_stage), stage
-    ) + (r"内" if stage == 1 else r"内?")
+        _number_pattern(r"[1１][0０]", "十", deadline_number_stage), deadline_number_stage
+    ) + r"内?"
     month_6 = (
         _number_pattern(r"[6６]", "六", deadline_number_stage)
         + artifact_gap
@@ -116,7 +116,7 @@ def _features_for_context(context: str, stage: int) -> dict:
     regulator = r"(?:中国证监会|中国证券监督管理委员会|证监会|CSRC)"
     report = rf"(?:报告(?:至|给)?{regulator}|(?:向|报送至)?{regulator}(?:报告|报送|备案|说明原因)|报{regulator}(?:备案)?)"
     solution = r"(?:(?:提出|制定|报送)(?:相应的?)?)?(?:解决|处置|应对)方案"
-    holder = r"(?:本?基金)?(?:份额)?持有" + artifact_gap + r"人大会"
+    holder = r"(?:本?基金)?(?:份额)?持有" + artifact_gap + r"人" + artifact_gap + r"大" + artifact_gap + r"会"
     meeting = rf"(?:召集|召开){artifact_gap}{holder}"
     no_meeting = rf"(?:不需|无需|不需要|无须|不必){artifact_gap}(?:召集|召开)?{artifact_gap}{holder}"
     termination = (
@@ -153,12 +153,26 @@ def _features_for_context(context: str, stage: int) -> dict:
         for trigger in re.finditer(trigger_pattern, context):
             sentence = _sentence_around(context, trigger.start(), trigger.end())
             legacy_direct = (
-                stage == 3
+                stage >= 2
                 and re.search(people_100, context)
                 and re.search(regulator, sentence)
             )
+            # 隐式无需大会：触发句有决定性终止措辞但完全没有持有人大会字样。
+            # 覆盖过渡期合同(200人阈值+旧式"有权终止"措辞)和阶段未覆盖的老合同。
+            # 必须区分"有权终止"(决定性的)和"如…终止基金合同等"(方案列举)。
+            # 权威词与终止词间距收紧到25字以内，避免"应当…报告…如…终止等"误匹配。
+            forced_termination = re.search(
+                r"(?:有权|可直接|应当|必须|应).{0,25}?终止", sentence
+            ) or re.search(r"(?:宣布|宣告|直接).{0,10}?终止", sentence)
+            implicit_no_meeting = (
+                stage >= 1
+                and forced_termination
+                and not re.search(no_meeting, sentence)
+                and not re.search(meeting, sentence)
+                and not re.search(holder, sentence)
+            )
             if re.search(termination, sentence) and (
-                re.search(no_meeting, sentence) or legacy_direct
+                re.search(no_meeting, sentence) or legacy_direct or implicit_no_meeting
             ):
                 type_3_chain = True
                 continue
@@ -199,9 +213,23 @@ def _features_for_context(context: str, stage: int) -> dict:
         if re.search(report, context) and re.search(solution, context):
             type_1_chain = True
 
+    # 检测 bounded window 内6月存在但大会缺失 → PDF断词信号
+    _six_in_window = False
+    _meet_in_window = False
+    for trigger_pattern in (day_50, day_60):
+        for trigger in re.finditer(trigger_pattern, context):
+            window = _bounded_window(context, trigger.start(), 700)
+            if re.search(month_6, window):
+                _six_in_window = True
+            if re.search(meeting, window):
+                _meet_in_window = True
+            if _six_in_window and _meet_in_window:
+                break
+
     features["type_1_chain"] = type_1_chain
     features["type_2_chain"] = type_2_chain
     features["type_3_chain"] = type_3_chain
+    features["broken_t2_chain"] = _six_in_window and not _meet_in_window
     return features
 
 def classify(text: str, stage: int = 1) -> tuple:
@@ -288,6 +316,8 @@ def classify(text: str, stage: int = 1) -> tuple:
         if detail["type_2_chain"]:
             return ("类型2: 备案+6个月大会", text_preview(context), detail)
         if detail["type_1_chain"]:
+            if stage == 1 and detail.get("broken_t2_chain"):
+                return (None, text_preview(context), detail)
             return ("类型1: 备案", text_preview(context), detail)
 
     return (None, text_preview(contexts[0]), first_detail)
