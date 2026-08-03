@@ -282,6 +282,50 @@ class ClassifierRegressionTests(unittest.TestCase):
         actual, _, detail = classify(text, stage=3)
         self.assertEqual(TYPE_1, actual)
         self.assertFalse(detail["has_50"])
+    def test_type3_accepts_thirty_day_auto_termination(self):
+        """30日+1亿元自动终止变体(南方基金系列)"""
+        text = (
+            "连续20个工作日出现基金份额持有人数量不满200人或者基金资产净值低于"
+            "5000万元情形的，基金管理人应当在定期报告中予以披露；连续30个工作日"
+            "出现基金份额持有人数量不满200人或者基金资产净值低于1亿元情形的，"
+            "基金合同应当终止，无需召开基金份额持有人大会。"
+        )
+        self.assert_type(TYPE_3, text, stage=3)
+
+    def test_type3_accepts_thirty_day_with_chinese_numbers(self):
+        """30日中文数字+1亿元自动终止"""
+        text = (
+            "连续二十个工作日出现基金份额持有人数量不满二百人或者基金资产净值低于"
+            "五千万元情形的，基金管理人应当在定期报告中予以披露；连续三十个工作日"
+            "出现前述情形的，基金合同终止，不需召开基金份额持有人大会。"
+        )
+        self.assert_type(TYPE_3, text, stage=3)
+
+    def test_thirty_day_variant_classified_at_all_stages(self):
+        """30日变体使用阿拉伯数字，所有阶段均可分类为类型3"""
+        text = (
+            "连续20个工作日出现基金份额持有人数量不满200人或者基金资产净值低于"
+            "5000万元情形的，基金管理人应当在定期报告中予以披露；连续30个工作日"
+            "出现基金份额持有人数量不满200人或者基金资产净值低于1亿元情形的，"
+            "基金合同应当终止，无需召开基金份额持有人大会。"
+        )
+        self.assert_type(TYPE_3, text, stage=1)
+        self.assert_type(TYPE_3, text, stage=2)
+        self.assert_type(TYPE_3, text, stage=3)
+
+    def test_old_contract_hundred_holder_manager_right_to_terminate(self):
+        """旧合同100人+证监会批准后有权宣布终止(银河收益151002)"""
+        text = (
+            "在本系列基金合同生效后的存续期内，若连续20个工作日某个基金的持有人"
+            "数量达不到100人，或连续20个工作日该基金的基金资产净值低于5000万元"
+            "人民币，基金管理人应当及时向中国证监会报告，说明出现上述情况的原因"
+            "以及解决方案。若连续60个工作日某个基金的持有人数量达不到100人，或"
+            "连续60个工作日该基金的基金资产净值低于5000万元人民币，则基金管理人"
+            "在经中国证监会批准后有权宣布该基金终止。"
+        )
+        self.assert_type(None, text, stage=2)
+        self.assert_type(TYPE_3, text, stage=3)
+
     def test_invalid_stage_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "stage must be 1, 2, or 3"):
             classify("任意文本", stage=0)
