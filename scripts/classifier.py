@@ -114,7 +114,7 @@ def _features_for_context(context: str, stage: int) -> dict:
     )
 
     regulator = r"(?:中国证监会|中国证券监督管理委员会|证监会|CSRC)"
-    report = rf"(?:报告(?:至|给)?{regulator}|(?:向|报送至)?{regulator}(?:报告|报送|备案|说明原因)|报{regulator}(?:备案)?)"
+    report = rf"(?:报告(?:至|给)?{regulator}|(?:向|报送至)?{regulator}{artifact_gap}(?:报告|报送|备案|说明原因)|报{regulator}{artifact_gap}(?:备案)?)"
     solution = r"(?:(?:提出|制定|报送)(?:相应的?)?)?(?:解决|处置|应对)方案"
     holder = r"(?:本?基金)?(?:份额)?持有" + artifact_gap + r"人" + artifact_gap + r"大" + artifact_gap + r"会"
     meeting = rf"(?:召集|召开){artifact_gap}{holder}"
